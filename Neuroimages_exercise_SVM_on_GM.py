@@ -13,10 +13,6 @@ import SimpleITK as sitk
 
 import glob
 
-from keras.layers import Dense, Input, Conv3D,Conv2D, Conv3DTranspose, Conv2DTranspose, BatchNormalization, Activation, AveragePooling3D, MaxPooling3D, MaxPooling2D, Flatten, UpSampling3D, Concatenate#FILL ME# Which layer
-from keras.models import Model, Sequential
-from keras.losses import binary_crossentropy
-from skimage.transform import rescale, resize
 
 
 if __name__=="__main__":
@@ -75,7 +71,7 @@ if __name__=="__main__":
     CTRL_GM = []
     AD_GM = []
     for x in CTRL_images:
-        threshold_filters= sitk.LaplacianSharpeningImageFilter()#first selection of the zones
+        threshold_filters= sitk.LaplacianSharpeningImageFilter()#first selection of the zones, basically useless exept in some cracks' elimination
         
         thresh_img = threshold_filters.Execute(x)
     
@@ -89,6 +85,7 @@ if __name__=="__main__":
         data = sitk.GetArrayFromImage(thresh_img)
         #Taking GM elements
         filtered_img = np.where(data == 1, sitk.GetArrayViewFromImage(x), data)
+        filtered_img = filtered_img[40:60,:,:]#select slices to append, be coherent with the selection in AD
         CTRL_GM.append(filtered_img.flatten())
     for x in AD_images:
         threshold_filters= sitk.LaplacianSharpeningImageFilter()#first selection of the zones
@@ -105,21 +102,18 @@ if __name__=="__main__":
         data = sitk.GetArrayFromImage(thresh_img)
         #Taking GM elements
         filtered_img = np.where(data == 1, sitk.GetArrayViewFromImage(x), data)
+        filtered_img = filtered_img[40:60,:,:] #select slices to append, be coherent with the selection in CTRL
         AD_GM.append(filtered_img.flatten())
 #%% Making labels
-    import pandas as pd
     dataset = []
-    zeros = np.array([-1]*len(CTRL_images))
+    zeros = np.array([-1]*len(CTRL_images)) #My choice, change it if you like
     ones = np.asarray([1]*len(AD_images))
     dataset.extend(CTRL_GM)
     dataset.extend(AD_GM)
     dataset = np.array(dataset)
     labels = np.append(zeros, ones, axis = 0).tolist()
-    # df = pd.DataFrame()
-    # df['Data'] = dataset
-    # df['Labels'] = labels
-    #datase, labels = dataset[..., np.newaxis], labels[..., np.newaxis]
-#%% Now try a SVM-RFE
+    
+#%% Now, let's try a SVM-RFE
     from sklearn.model_selection import train_test_split
     from sklearn.preprocessing import StandardScaler
     from sklearn.svm import SVC
@@ -133,8 +127,7 @@ if __name__=="__main__":
     classifier = SVC(kernel='linear', probability=True)
     classifier = classifier.fit(train_set_data, train_set_lab)
     coef_vect = classifier.coef_ #vettore dei pesi
-    classifier = classifier.fit(train_set_data, train_set_lab, np.abs(coef_vect))
-    coef_vect = classifier.coef_ #vettore dei pesi
+    
     #%%Resume of above
     print(classifier)
     print(classifier.score(test_set_data, test_set_lab))
@@ -145,19 +138,57 @@ if __name__=="__main__":
     from sklearn.model_selection import RepeatedStratifiedKFold
 
     X, y = dataset, np.array(labels)
-    n_splits = 20#secondo articolo(mi sembra) 
+    n_splits = 20#taken from article 
+    rfe = RFE(estimator=SVC(kernel='linear', probability=True), n_features_to_select=6000, step=0.5) #"Step" tell us how many feature it drop fo each iteration
+    FIT = rfe.fit(X,y)
     #%%
-    rfe = RFE(estimator=SVC(kernel='linear', probability=True), n_features_to_select=1000)
+    fig, ax = plt.subplots()
+    ax.imshow(sitk.GetArrayViewFromImage(CTRL_images[0])[:,40,:], cmap = 'Greys_r')
+    ax.imshow(FIT.support_.reshape(20,145,121).astype(int)[:,40,:], alpha = 0.6, cmap='RdGy_r')#WARNING: use the shape that you used in filtered_img
+    #%%
+    rfe = RFE(estimator=SVC(kernel='linear', probability=True), n_features_to_select=6000, step=0.5)
     model = SVC(kernel='linear', probability=True)
     pipeline = Pipeline(steps=[('s',rfe),('m',model)])
+    
     # evaluate model
     cv = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=1, random_state=1)
     n_scores = cross_val_score(pipeline, X, y, scoring='accuracy', cv=cv, n_jobs=-1, error_score='raise')
     # report performance
     print('Accuracy: %.3f (%.3f)' % (np.mean(n_scores), np.std(n_scores)))
 
+#%% 1D CNN feature extraction
+    from keras.layers import Dense, Input, Conv1D,Conv2D,  Conv2DTranspose, Activation, MaxPooling1D, MaxPooling2D, Flatten, UpSampling1D, Concatenate#FILL ME# Which layer
+    from keras.models import Model, Sequential
+    from keras.losses import binary_crossentropy
+    from skimage.transform import rescale, resize
 
-    #%%#PARTE COPIATA DALLA RETICO 
+
+    inputs=Input(shape=(dataset.shape[0],dataset.shape[1]))
+    conv = Conv1D(8, 3, strides=2, padding='same', activation='relu')(inputs)
+    pool = MaxPooling1D(5, strides=2)(conv)    
+    conv = Conv1D(32, 3, strides=1, padding='same',activation='relu')(pool)
+    conv = Conv1D(128, 3, padding='same', activation='relu')(conv)
+    flat = Flatten()(conv)
+    conv = Dense(32, activation = 'relu')(flat)
+    #t_conv =Conv1DTranspose(32, 3, strides=2,  padding='same', activation='relu')(conv)
+    #up = UpSampling1D(5, strides=2)(t_conv)
+    #t_conv =Conv1DTranspose(8, 3, strides=2,  padding='same', activation='relu')(up)
+    outputs = Dense(1,activation = 'softmax')(conv)
+    loss="binary_crossentropy"
+    model = Model(inputs=inputs, outputs=outputs)
+    model.compile(loss=loss, optimizer='adam',metrics=["accuracy"])
+    model.summary()
+    
+    
+    
+
+    #%%
+    history=model.fit(X[np.newaxis,...], y[np.newaxis,...], validation_split=0.2,epochs=10, verbose=1, batch_size=1, shuffle=False)
+    print(history.history.keys())
+    plt.plot(history.history["val_loss"])
+    plt.plot(history.history["loss"])
+    plt.show()
+    #%%#
      
     def plot_cv_roc(X, y, classifier, n_splits, scaler=None):
         if scaler:
@@ -223,6 +254,7 @@ if __name__=="__main__":
         plt.legend(loc="lower right", prop={'size': 15})
         plt.show()
     
+    classifier = SVC(kernel='linear', probability=True)
     plot_cv_roc(X,y, classifier, n_splits, scaler=None)
     #%%Resume of above
     print(classifier)
